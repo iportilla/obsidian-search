@@ -12,8 +12,9 @@ BROWSE_ROOT = os.path.abspath(os.environ.get("BROWSE_ROOT", os.path.expanduser("
 ALLOW_ANY_PATH = os.environ.get("ALLOW_ANY_PATH", "0") == "1"
 
 # Obsidian deep-link configuration
-OBSIDIAN_CONTAINER_PREFIX = os.environ.get("OBSIDIAN_CONTAINER_PREFIX", "/vault")
-OBSIDIAN_HOST_PREFIX = os.environ.get("OBSIDIAN_HOST_PREFIX", "")
+OBSIDIAN_CONTAINER_PREFIX = os.path.normpath(os.environ.get("OBSIDIAN_CONTAINER_PREFIX", "/vault"))
+OBSIDIAN_HOST_PREFIX = os.path.normpath(os.environ.get("OBSIDIAN_HOST_PREFIX", ""))
+# If you know your Obsidian vault display name, set this and we’ll use vault+file deep links.
 OBSIDIAN_VAULT_NAME = os.environ.get("OBSIDIAN_VAULT_NAME", "")
 
 # ---------------- In-memory state ----------------
@@ -28,7 +29,9 @@ def within_root(p: Path) -> bool:
     if ALLOW_ANY_PATH:
         return True
     try:
-        return os.path.commonpath([p.resolve(), Path(BROWSE_ROOT).resolve()]) == str(Path(BROWSE_ROOT).resolve())
+        return os.path.commonpath([p.resolve(strict=False), Path(BROWSE_ROOT).resolve(strict=False)]) == str(
+            Path(BROWSE_ROOT).resolve(strict=False)
+        )
     except Exception:
         return False
 
@@ -52,7 +55,7 @@ def crawl_obsidian_vault(folder_path: str):
             docs[doc_id] = {
                 "title": title,
                 "content": text,
-                "path": str(Path(path).resolve()),  # absolute (container-visible)
+                "path": str(Path(path).resolve()),
                 "rel_path": rel_path
             }
             index.append((doc_id, text))
@@ -61,10 +64,11 @@ def crawl_obsidian_vault(folder_path: str):
 
 
 def system_root_for(path: Path) -> Path:
-    """Return filesystem root for a given path (handles Windows drive roots)."""
-    p = path.resolve()
+    """Return filesystem root for a given path (handles Windows drive roots safely)."""
+    p = path.resolve(strict=False)
     if os.name == "nt":
-        return Path(p.anchor or (p.drive + "\"))
+        anchor = p.anchor if p.anchor else (p.drive + os.sep)  # e.g., 'C:\\'
+        return Path(anchor)
     return Path("/")
 
 
@@ -78,7 +82,9 @@ def map_container_to_host(abs_path: str) -> str:
         cp = os.path.normpath(OBSIDIAN_CONTAINER_PREFIX)
         hp = os.path.normpath(OBSIDIAN_HOST_PREFIX)
         ap = os.path.normpath(abs_path)
-        if ap.startswith(cp):
+        if ap == cp:
+            return hp
+        if ap.startswith(cp + os.sep):
             return hp + ap[len(cp):]
     return abs_path
 
@@ -322,15 +328,17 @@ listDir(currentPath);
 # ---------------- Routes ----------------
 @app.route("/")
 def home():
-    footer_note = "Browse anywhere on this machine (unsafe mode)" if ALLOW_ANY_PATH                   else "Browsing is limited to the configured root"
-    browse_hint = "Full filesystem access enabled" if ALLOW_ANY_PATH                   else "Tip: start server with --allow-any-path to browse anywhere"
+    footer_note = "Browse anywhere on this machine (unsafe mode)" if ALLOW_ANY_PATH \
+                  else "Browsing is limited to the configured root"
+    browse_hint = "Full filesystem access enabled" if ALLOW_ANY_PATH \
+                  else "Tip: start server with --allow-any-path to browse anywhere"
     return render_template_string(PAGE, root=BROWSE_ROOT, footer_note=footer_note, browse_hint=browse_hint)
 
 
 @app.route("/api/ls")
 def api_ls():
     raw = request.args.get("path", BROWSE_ROOT)
-    path = Path(raw).expanduser().resolve()
+    path = Path(raw).expanduser().resolve(strict=False)
 
     if not within_root(path):
         abort(403, description="Path outside of allowed root")
@@ -342,13 +350,13 @@ def api_ls():
         root = system_root_for(path)
         current = root
         crumbs = [{"label": str(root), "path": str(root)}]
-        rel_parts = path.resolve().parts[len(root.resolve().parts):]
+        rel_parts = path.resolve(strict=False).parts[len(root.resolve(strict=False).parts):]
         for part in rel_parts:
             current = current.joinpath(part)
             crumbs.append({"label": part, "path": str(current)})
         parent = str(path.parent) if path != root else None
     else:
-        base = Path(BROWSE_ROOT).resolve()
+        base = Path(BROWSE_ROOT).resolve(strict=False)
         crumbs = [{"label": str(base), "path": str(base)}]
         try:
             rel = path.relative_to(base)
@@ -361,13 +369,17 @@ def api_ls():
         parent = str(path.parent) if path != base else None
 
     dirs, files = [], []
-    for entry in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        abort(403, description="Permission denied")
+    for entry in entries:
         try:
             if entry.is_dir():
                 if within_root(entry):
-                    dirs.append({"name": entry.name, "path": str(entry.resolve())})
+                    dirs.append({"name": entry.name, "path": str(entry.resolve(strict=False))})
             else:
-                files.append({"name": entry.name, "path": str(entry.resolve())})
+                files.append({"name": entry.name, "path": str(entry.resolve(strict=False))})
         except Exception:
             continue
 
@@ -389,7 +401,7 @@ def api_set_vault():
     if not req_path:
         abort(400, description="Missing path")
 
-    path = Path(req_path).expanduser().resolve()
+    path = Path(req_path).expanduser().resolve(strict=False)
     if not within_root(path):
         abort(403, description="Path outside of allowed root")
     if not path.is_dir():
@@ -464,8 +476,8 @@ if __name__ == "__main__":
     ALLOW_ANY_PATH = bool(args.allow_any_path) or ALLOW_ANY_PATH
     BROWSE_ROOT = os.path.abspath(args.browse_root)
     OBSIDIAN_VAULT_NAME = args.vault_name or OBSIDIAN_VAULT_NAME
-    OBSIDIAN_CONTAINER_PREFIX = args.container_prefix or OBSIDIAN_CONTAINER_PREFIX
-    OBSIDIAN_HOST_PREFIX = args.host_prefix or OBSIDIAN_HOST_PREFIX
+    OBSIDIAN_CONTAINER_PREFIX = os.path.normpath(args.container_prefix or OBSIDIAN_CONTAINER_PREFIX)
+    OBSIDIAN_HOST_PREFIX = os.path.normpath(args.host_prefix or OBSIDIAN_HOST_PREFIX)
 
     # Ensure starting folder exists
     os.makedirs(BROWSE_ROOT, exist_ok=True)
